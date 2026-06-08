@@ -951,29 +951,49 @@ def schedule_flexible(class_list, subject_rows, shared_teacher_busy=None, attemp
     return slots, conflicts, double_booked
 
 
-def schedule_all(class_subjects_map):
-    """Legacy scheduler (Gr 9/10/11-12)."""
+def schedule_all(class_subjects_map, shared_teacher_busy=None, tid_to_name=None, attempt=0):
+    """Legacy scheduler (Gr 9/10/11-12).
+
+    Teacher conflicts are tracked by TEACHER NAME (resolved via tid_to_name)
+    rather than by ID, so a teacher who appears under several IDs — e.g. the
+    same person teaching both the PED and NAT streams, or teaching across two
+    grades — is never double-booked. `shared_teacher_busy` (a set of
+    (teacher_name, day, period)) carries bookings from OTHER grades so the same
+    person is not placed twice across grades. `attempt` seeds light randomness
+    so a best-of-N caller can explore alternative layouts."""
+    import random as _r
+    rng = _r.Random(20260608 + attempt * 7919)
+    def jit():
+        return rng.random() if attempt else 0.0
+    def nm(tid):
+        return tid_to_name.get(tid, tid) if tid_to_name else tid
+
     all_classes = list(class_subjects_map.keys())
     slots = {cls: {d: {p: None for p in PERIOD_SNS} for d in range(1, 6)}
              for cls in all_classes}
 
-    teacher_busy     = set()
+    teacher_busy     = set()              # (teacher_name, day, period)
     class_day_load   = defaultdict(int)
-    teacher_day_load = defaultdict(int)
+    teacher_day_load = defaultdict(int)   # keyed by teacher_name
     subj_day_placed  = defaultdict(int)
 
     MAX_PER_DAY     = len(PERIOD_SNS)
     MAX_TEACHER_DAY = 9
+
+    # Seed cross-grade bookings (so shared teachers are blocked where busy elsewhere)
+    if shared_teacher_busy:
+        for (tname, d, p) in shared_teacher_busy:
+            teacher_busy.add((tname, d, p))
 
     tasks = []
     for cls, subjs in class_subjects_map.items():
         for code, name, tid, pw, room, *_ in subjs:
             if pw > 0:
                 tasks.append((cls, code, name, pw, room, tid))
-    tasks.sort(key=lambda x: -x[3])
+    tasks.sort(key=lambda x: (-x[3], jit()))
     remaining = {(t[0], t[1]): t[3] for t in tasks}
 
-    # Pre-place Assembly
+    # Pre-place Assembly (whole-school shared event — not blocked by shared busy)
     for cls, code, name, pw, room, tid in tasks:
         if not (_is_assembly(name) or _is_assembly(code)):
             continue
@@ -981,39 +1001,44 @@ def schedule_all(class_subjects_map):
         if slots[cls][d][p] is not None:
             continue
         slots[cls][d][p] = (code, name, tid, room)
-        teacher_busy.add((tid, d, p))
+        teacher_busy.add((nm(tid), d, p))
         class_day_load[(cls, d)]        += 1
-        teacher_day_load[(tid, d)]      += 1
+        teacher_day_load[(nm(tid), d)]  += 1
         subj_day_placed[(cls, code, d)] += 1
         remaining[(cls, code)]          -= 1
 
     for _ in range(25000):
         placed_any = False
-        for cls, code, name, pw, room, tid in tasks:
+        order = list(tasks)
+        if attempt:
+            rng.shuffle(order)
+        for cls, code, name, pw, room, tid in order:
             if remaining.get((cls, code), 0) <= 0:
                 continue
+            tname = nm(tid)
             days_ord = sorted(range(1, 6), key=lambda d: (
                 subj_day_placed[(cls, code, d)],
                 class_day_load[(cls, d)],
-                teacher_day_load[(tid, d)],
+                teacher_day_load[(tname, d)],
+                jit(),
             ))
             for d in days_ord:
                 if class_day_load[(cls, d)]   >= MAX_PER_DAY:    continue
-                if teacher_day_load[(tid, d)] >= MAX_TEACHER_DAY: continue
+                if teacher_day_load[(tname, d)] >= MAX_TEACHER_DAY: continue
                 if subj_day_placed[(cls, code, d)] >= 3:          continue
                 for p in PERIOD_SNS:
                     if d == ASSEMBLY_DAY and p == ASSEMBLY_PERIOD: continue
                     if slots[cls][d][p] is not None:      continue
-                    if (tid, d, p) in teacher_busy:        continue
+                    if (tname, d, p) in teacher_busy:      continue
                     pidx = PERIOD_SNS.index(p)
                     if pidx > 0:
                         prev = PERIOD_SNS[pidx - 1]
                         if slots[cls][d][prev] and slots[cls][d][prev][0] == code:
                             continue
                     slots[cls][d][p] = (code, name, tid, room)
-                    teacher_busy.add((tid, d, p))
+                    teacher_busy.add((tname, d, p))
                     class_day_load[(cls, d)]        += 1
-                    teacher_day_load[(tid, d)]      += 1
+                    teacher_day_load[(tname, d)]    += 1
                     subj_day_placed[(cls, code, d)] += 1
                     remaining[(cls, code)]          -= 1
                     placed_any = True
@@ -1024,12 +1049,23 @@ def schedule_all(class_subjects_map):
         if not placed_any:
             break
 
-    conflicts     = {k: v for k, v in remaining.items() if v > 0}
-    tc            = Counter()
+    conflicts = {k: v for k, v in remaining.items() if v > 0}
+
+    # Publish this grade's bookings to the shared set (keyed by teacher name)
+    if shared_teacher_busy is not None:
+        for cls in all_classes:
+            for d in range(1, 6):
+                for p in PERIOD_SNS:
+                    e = slots[cls][d][p]
+                    if e:
+                        shared_teacher_busy.add((nm(e[2]), d, p))
+
+    tc = Counter()
     for cls in all_classes:
         for d in range(1, 6):
             for p in PERIOD_SNS:
                 e = slots[cls][d][p]
-                if e: tc[(e[2], d, p)] += 1
+                if e:
+                    tc[(nm(e[2]), d, p)] += 1
     double_booked = {k: v for k, v in tc.items() if v > 1}
     return slots, conflicts, double_booked

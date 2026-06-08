@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """
-web_app.py — Lyceum Timetable Generator (Web Edition v2)
+web_app.py — Lyceum Timetable Generator (Web Edition v3)
 ─────────────────────────────────────────────────────────
-Key improvements over v1:
-  • "Generate All Grades" schedules Grade 6, 7, 8 together with a shared
-    teacher-busy set — Option-block teachers (Sakna, Pulakshika, EFF1/2/3,
-    Religion teachers …) can never be double-booked across grades.
-  • Result (Step 3) shows ALL THREE grades simultaneously: grade tabs on top,
-    class tabs below.  No more switching back to Step 1 to see another grade.
-  • Per-grade Generate still works for single-grade edits.
+Key features:
+  • "Generate All Grades" schedules every grade (6, 7, 8, 9, 10, 11-12)
+    against ONE shared teacher-busy set, so any teacher shared between grades
+    (Grade 9 & 10 staff, Mr. Radun across 9/10/11-12, option-block teachers in
+    6-8 …) is never double-booked anywhere.
+  • Grades 9, 10 and 11-12 (Edexcel / National streams) are auto-converted from
+    the legacy data into the editable flexible format, with the school rules:
+    National maths = 1 teacher, Edexcel maths = 2 (one per grade); Edexcel
+    Sinhala = Ms. Disna, National Sinhala = Ms. Sewwandi; National religion =
+    Buddhism (2) alongside Cultural Dancing (2).
+  • Every subject/teacher can be edited, added or deleted before generating.
+  • Shared teachers get a single COMBINED personal timetable across all grades.
+  • Result (Step 3) shows all grades at once: grade tabs on top, class tabs below.
 
 Run:  python web_app.py
 """
@@ -39,14 +45,211 @@ SN_LABEL = {sn: lab for sn, _t, lab, _b in TIME_SLOTS}
 # ─────────────────────────────────────────────────────────────────────────────
 #  Helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ── Convert legacy stream-based grades (9, 10, 11-12) into the flexible format ──
+_SCIENCE       = {"chemistry", "biology", "physics"}
+_COMMERCE_LIKE = {"commerce", "accounting", "business studies", "economics",
+                  "cs/ict", "commerce/lit"}
+
+
+def _is_asm(name):
+    n = str(name).strip().lower()
+    return n == "asm" or "assembl" in n
+
+
+def _is_dancing(subj):
+    s = str(subj).lower()
+    return "dancing" in s or "aesthet" in s
+
+
+def _role(subj):
+    """Short, readable role label for a generic teacher placeholder."""
+    s = str(subj).strip().lower()
+    table = {
+        "mathematics": "Maths", "combined maths": "Combined Maths",
+        "sinhala/tamil": "Sinhala", "eff. speech": "Speech",
+        "effective speech": "Speech", "motivational speech": "Speech",
+        "cs/ict": "ICT", "ict": "ICT", "history/geo": "History",
+        "science/chem": "Science", "general english": "English",
+        "r.catholicism": "Religion", "religion": "Religion",
+        "business studies": "Business", "science award": "Science",
+        "physical education": "PE", "biology/sci": "Biology",
+        "physics/sci": "Physics", "english/lit": "English",
+    }
+    if s in table:
+        return table[s]
+    return str(subj).strip().title()
+
+
+def _eligible_classes(stream_classes, subj, note, grade_name):
+    n = (note or "").lower()
+    s = subj.lower()
+    def has(c, *keys):
+        cl = c.lower()
+        return any(k in cl for k in keys)
+    if "sci a&b" in n or "sci a & b" in n:
+        return [c for c in stream_classes if has(c, "sci a", "sci b")]
+    if "nat sci only" in n:
+        return [c for c in stream_classes if has(c, "nat sci")]
+    if "nat com only" in n:
+        return [c for c in stream_classes if has(c, "nat com")]
+    if "com only" in n or "commerce only" in n or "ped com only" in n:
+        return [c for c in stream_classes if has(c, "com")]
+    if "11" in grade_name or "12" in grade_name or "AL" in grade_name:
+        if s in _SCIENCE or s == "combined maths":
+            sci = [c for c in stream_classes if has(c, "sci")]
+            if sci:
+                return sci
+        if s in _COMMERCE_LIKE:
+            com = [c for c in stream_classes if has(c, "com")]
+            if com:
+                return com
+    return list(stream_classes)
+
+
+def _aesthetic_group():
+    """The shared aesthetic teacher group — the SAME people who teach the
+    Art/Music/Dance option block in Grades 6, 7 & 8. Reused (same names) in
+    Grades 9 & 10 so the one global teacher-busy set keeps them clash-free
+    across every grade. Falls back to generic names if 6-8 isn't present."""
+    for g in _FLEX_NATIVE:
+        for row in g["subject_rows"]:
+            if isinstance(row, dict) and row.get("type") == "merge_block":
+                subs = {str(t.get("subject", "")).lower() for t in row.get("teachers", [])}
+                if {"art", "dancing", "eastern music"} & subs:
+                    return [{"teacher": t["teacher"], "subject": t["subject"],
+                             "room": t.get("room", "R-AES")}
+                            for t in row.get("teachers", [])]
+    return [{"teacher": "Aesthetic Teacher 1", "subject": "Art",     "room": "R-ART"},
+            {"teacher": "Aesthetic Teacher 2", "subject": "Dancing", "room": "R-DAN"},
+            {"teacher": "Aesthetic Teacher 3", "subject": "Music",   "room": "R-MUS"}]
+
+
+def _pairs(classes):
+    """Chunk classes into groups of two for an option/merge block."""
+    return [classes[i:i + 2] for i in range(0, len(classes), 2)]
+
+
+def build_generic_map(grade_list, prefix=""):
+    """real teacher name -> generic '<prefix>Role Teacher N', consistent across
+    all the grades that share one staff namespace. The prefix keeps the two
+    pools (Grade 9-10 vs Grade 11-12) from colliding into the same names."""
+    m, cnt = {}, {}
+    for lg in grade_list:
+        for t in lg["teachers"]:
+            real, subj = t[1], t[2]
+            if real in m:
+                continue
+            role = _role(subj)
+            cnt[role] = cnt.get(role, 0) + 1
+            m[real] = f"{prefix}{role} Teacher {cnt[role]}"
+    return m
+
+
+def legacy_to_flexible(lg, name_map, ns=""):
+    """Convert a legacy grade to flexible format using GENERIC placeholder names
+    (drawn from `name_map`, shared across the grade's staff namespace) and the
+    school's specific rules for Grades 9 & 10. `ns` is the namespace prefix."""
+    tmap = {t[0]: t[1] for t in lg["teachers"]}
+    name = lg["name"]
+    classes = list(lg["classes"].keys())
+    is_910 = name in ("Grade 9", "Grade 10")
+    rows = []
+    for stream in lg["streams"]:
+        stream_classes = [c for c, st in lg["classes"].items() if st == stream]
+        for entry in lg["subjects"][stream]:
+            code, subj, tid, periods, room, note = entry
+            if code == "ASM" or _is_asm(subj):
+                continue                      # Assembly auto-placed by scheduler
+            elig = _eligible_classes(stream_classes, subj, note, name)
+            if not elig:
+                continue
+            real = tmap.get(tid, tid)
+            tname = name_map.get(real, real)  # generic placeholder
+
+            # ── Grade 9 & 10 specific rules ───────────────────────────────
+            if is_910:
+                if _is_dancing(subj):
+                    # Cultural Dancing → Aesthetic, taught by the shared 6-8
+                    # aesthetic group as an option block (added once below).
+                    continue
+                if "sinhala" in subj.lower():
+                    tname = (ns + "Sinhala Teacher (Edexcel)" if stream == "PED"
+                             else ns + "Sinhala Teacher (National)")
+                if subj.lower() == "mathematics":
+                    # National = ONE shared maths teacher (both grades).
+                    # Edexcel = TWO maths teachers (one per grade) so the load
+                    # is feasible and stays feasible if periods change.
+                    if stream == "NAT":
+                        tname = ns + "Maths Teacher 1 (National)"
+                    else:
+                        tname = (ns + "Maths Teacher 1 (Edexcel)" if name == "Grade 9"
+                                 else ns + "Maths Teacher 2 (Edexcel)")
+                if "english" in subj.lower():
+                    if stream == "NAT":
+                        tname = (ns + "English Teacher 1 (National)" if name == "Grade 9"
+                                 else ns + "English Teacher 2 (National)")
+                if stream == "NAT" and (code == "REL" or subj.lower() == "religion"):
+                    subj = "Buddhism"
+                    periods = 2               # Aesthetic(2) + Buddhism(2) category
+                    tname = ns + "Buddhism Teacher"
+
+            rows.append((tname, subj, {c: periods for c in elig},
+                         [], False, False, room))
+
+    # ── Aesthetic option block for Grades 9 & 10 (same teachers as 6-8) ──────
+    blocks = []
+    if is_910:
+        blocks.append({
+            "type": "merge_block", "block_id": "aesthetic_%s" % name[-1],
+            "periods": 2, "same_day": True,
+            "merge_pairs": _pairs(classes), "standalone": {},
+            "teachers": _aesthetic_group(),
+        })
+
+    # reference teacher table for the Setup sheet
+    seen, tref = set(), []
+    for (tname, subj, pc, _m, _s, _a, _r) in rows:
+        if (tname, subj) in seen:
+            continue
+        seen.add((tname, subj))
+        tref.append(("L%02d" % (len(tref) + 1), tname, subj))
+    for blk in blocks:
+        for t in blk["teachers"]:
+            if (t["teacher"], t["subject"]) not in seen:
+                seen.add((t["teacher"], t["subject"]))
+                tref.append(("L%02d" % (len(tref) + 1), t["teacher"], t["subject"]))
+
+    return {"name": name, "file": lg["file"], "setup_mode": "flexible",
+            "classes": classes, "subject_rows": rows + blocks, "teachers": tref}
+
+
+# Build the full grade registry: native flexible 6/7/8 + converted 9/10/11-12.
+_FLEX_NATIVE = [g for g in data.GRADE_GROUPS if g.get("setup_mode") == "flexible"]
+_LEGACY_SRC  = [g for g in data.GRADE_GROUPS if g.get("setup_mode") == "legacy"]
+
+# Two separate staff namespaces: {Grade 9, Grade 10} share one pool; Grade 11-12
+# shares its own. Generic names are assigned consistently within each namespace.
+_NS_910  = [g for g in _LEGACY_SRC if g["name"] in ("Grade 9", "Grade 10")]
+_NS_1112 = [g for g in _LEGACY_SRC if g["name"] not in ("Grade 9", "Grade 10")]
+_MAP_910  = build_generic_map(_NS_910,  prefix="9/10 ")
+_MAP_1112 = build_generic_map(_NS_1112, prefix="11/12 ")
+
+_CONVERTED = []
+for _lg in _LEGACY_SRC:
+    if _lg["name"] in ("Grade 9", "Grade 10"):
+        _CONVERTED.append(legacy_to_flexible(_lg, _MAP_910, ns="9/10 "))
+    else:
+        _CONVERTED.append(legacy_to_flexible(_lg, _MAP_1112, ns="11/12 "))
+ALL_GRADES = _FLEX_NATIVE + _CONVERTED
+
+
 def flex_grades():
-    return [g for g in data.GRADE_GROUPS
-            if g.get("setup_mode") == "flexible"
-            and g["name"] in ("Grade 6", "Grade 7", "Grade 8")]
+    return ALL_GRADES
 
 
 def get_grade(name):
-    for g in data.GRADE_GROUPS:
+    for g in ALL_GRADES:
         if g["name"] == name:
             return g
     return None
@@ -60,8 +263,11 @@ def setup_payload(grp):
         if isinstance(row, (list, tuple)):
             tch, subj, pc, mgs, sd, a1, room = row[:7]
             regular.append({
-                "id": ridx, "teacher": tch, "subject": subj, "room": room,
+                "id": "r%d" % ridx, "teacher": tch, "subject": subj,
+                "room": room or "R??",
                 "periods": {c: int(pc.get(c, 0)) for c in classes},
+                "same_day": bool(sd), "all_1period": bool(a1),
+                "merge_groups": "; ".join("+".join(g) for g in (mgs or [])),
             })
             ridx += 1
         elif isinstance(row, dict):
@@ -74,9 +280,10 @@ def setup_payload(grp):
             else:
                 continue
             blocks.append({
-                "id": bidx, "type": rtype, "label": label,
+                "id": "b%d" % bidx, "type": rtype, "label": label,
                 "teachers": [{"teacher": t.get("teacher", ""),
                                "subject":  t.get("subject", ""),
+                               "room":     t.get("room", "R??"),
                                "covers":   t.get("covers", "")}
                               for t in row.get("teachers", [])],
             })
@@ -85,38 +292,96 @@ def setup_payload(grp):
             "regular_rows": regular, "blocks": blocks}
 
 
-def apply_edits(grp, payload):
-    grp2 = copy.deepcopy(grp)
-    reg_edits = {r["id"]: r for r in payload.get("regular_rows", [])}
-    blk_edits = {b["id"]: b for b in payload.get("blocks", [])}
-    new_rows = []
-    ridx = bidx = 0
-    for row in grp2["subject_rows"]:
-        if isinstance(row, (list, tuple)):
-            tch, subj, pc, mgs, sd, a1, room = row[:7]
-            e = reg_edits.get(ridx)
-            if e:
-                tch = (e.get("teacher") or tch).strip()
-                pc = {}
-                for c, v in (e.get("periods") or {}).items():
-                    try:    v = int(v)
-                    except: v = 0
-                    if v > 0: pc[c] = v
-            new_rows.append((tch, subj, pc, mgs, sd, a1, room))
-            ridx += 1
-        elif isinstance(row, dict) and row.get("type") in ("religion_block", "merge_block"):
-            row = copy.deepcopy(row)
-            e = blk_edits.get(bidx)
-            if e:
-                names = e.get("teachers", [])
-                for i, t in enumerate(row.get("teachers", [])):
-                    if i < len(names) and str(names[i]).strip():
-                        t["teacher"] = str(names[i]).strip()
-            new_rows.append(row)
-            bidx += 1
+def _parse_merge_groups(s):
+    out = []
+    for part in str(s or "").split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        if "+" in part:
+            out.append([c.strip() for c in part.split("+") if c.strip()])
         else:
-            new_rows.append(row)
-    grp2["subject_rows"] = new_rows
+            out.append([part])
+    return out
+
+
+def apply_edits(grp, payload):
+    """Rebuild the grade's subject rows from the browser payload. Because the
+    rows are rebuilt (not patched positionally), teachers/subjects can be
+    EDITED, DELETED (simply absent from the payload) or ADDED (new entries)."""
+    grp2 = copy.deepcopy(grp)
+    classes = grp2["classes"]
+    reg_payload = payload.get("regular_rows", None)
+    blk_payload = {b.get("id"): b for b in payload.get("blocks", [])}
+
+    # ── Regular subject/teacher rows ──────────────────────────────────────
+    new_regular = []
+    if reg_payload is not None:
+        for e in reg_payload:
+            tch  = str(e.get("teacher", "")).strip()
+            subj = str(e.get("subject", "")).strip()
+            room = (str(e.get("room", "") or "").strip() or "R??")
+            sd   = bool(e.get("same_day", False))
+            a1   = bool(e.get("all_1period", False))
+            mgs  = _parse_merge_groups(e.get("merge_groups", ""))
+            pc = {}
+            for c, v in (e.get("periods") or {}).items():
+                if c not in classes:
+                    continue
+                try:
+                    v = int(v)
+                except (TypeError, ValueError):
+                    v = 0
+                if v > 0:
+                    pc[c] = v
+            if not subj or not tch:          # incomplete → skip silently
+                continue
+            if not pc and not a1:            # nothing to schedule → skip
+                continue
+            new_regular.append((tch, subj, pc, mgs, sd, a1, room))
+    else:
+        for row in grp2["subject_rows"]:
+            if isinstance(row, (list, tuple)):
+                new_regular.append(tuple(row[:7]))
+
+    # ── Shared blocks (religion / option) ─────────────────────────────────
+    new_blocks = []
+    bidx = 0
+    for row in grp2["subject_rows"]:
+        if isinstance(row, dict) and row.get("type") in ("religion_block", "merge_block"):
+            bkey = "b%d" % bidx
+            bidx += 1
+            row = copy.deepcopy(row)
+            e = blk_payload.get(bkey)
+            if e is None:
+                new_blocks.append(row)       # untouched block
+                continue
+            rebuilt = []
+            for i, te in enumerate(e.get("teachers", [])):
+                if isinstance(te, str):                       # legacy: name only
+                    name = te.strip()
+                    if not name:
+                        continue
+                    base = dict(row["teachers"][i]) if i < len(row["teachers"]) else {}
+                    base["teacher"] = name
+                    rebuilt.append(base)
+                elif isinstance(te, dict):
+                    name = str(te.get("teacher", "")).strip()
+                    subj = str(te.get("subject", "")).strip()
+                    if not name or not subj:
+                        continue
+                    nt = {"teacher": name, "subject": subj,
+                          "room": (str(te.get("room", "") or "").strip() or "R??")}
+                    if row.get("type") == "religion_block":
+                        nt["covers"] = (str(te.get("covers", "") or "").strip()
+                                        or "All classes")
+                    rebuilt.append(nt)
+            if rebuilt:                       # keep block only if it still has teachers
+                row["teachers"] = rebuilt
+                new_blocks.append(row)
+            # else: every option removed → drop the whole block
+
+    grp2["subject_rows"] = new_regular + new_blocks
     return grp2
 
 
@@ -162,7 +427,7 @@ def build_grids(slots, classes):
     return rows_meta, grids
 
 
-def _run_single_grade(grp2, shared_busy=None):
+def _run_single_grade(grp2, shared_busy=None, max_attempts=80):
     """Generate one grade's workbook. Returns (path, slots, stats, logs)."""
     safe = re.sub(r'[^A-Za-z0-9]', '_', grp2["name"])
     path = os.path.join(WORKDIR, f"{safe}_{uuid.uuid4().hex[:8]}.xlsx")
@@ -170,7 +435,8 @@ def _run_single_grade(grp2, shared_busy=None):
     write_setup_flexible(ws, grp2); wb.save(path)
 
     logs = []
-    kw = dict(log_callback=lambda m: logs.append(m), return_slots=True)
+    kw = dict(log_callback=lambda m: logs.append(m), return_slots=True,
+              max_attempts=max_attempts)
     if shared_busy is not None:
         kw["shared_teacher_busy"] = shared_busy
 
@@ -303,12 +569,18 @@ class Handler(BaseHTTPRequestHandler):
             grade_payloads = {p["grade"]: p for p in payload.get("grades", [])}
             shared_busy    = set()
             all_results    = []
+            # Schedule the tightly-shared senior grades (9, 10, 11-12) FIRST so their
+            # shared teachers claim slots before the lighter, independent grades 6-8.
+            order = {"Grade 9": 0, "Grade 10": 1, "Grade 11-12 AL": 2,
+                     "Grade 6": 3, "Grade 7": 4, "Grade 8": 5}
+            sched_grades = sorted(flex_grades(), key=lambda g: order.get(g["name"], 9))
             try:
-                for grp in flex_grades():
+                for grp in sched_grades:
                     gname = grp["name"]
                     gp    = grade_payloads.get(gname, {})
                     grp2  = apply_edits(grp, gp) if gp else copy.deepcopy(grp)
-                    path, slots, stats, logs = _run_single_grade(grp2, shared_busy)
+                    path, slots, stats, logs = _run_single_grade(grp2, shared_busy,
+                                                                  max_attempts=200)
                     classes  = grp2["classes"]
                     teachers = collect_teacher_names(grp2)
                     wb       = load_workbook(path, read_only=True)
@@ -330,6 +602,9 @@ class Handler(BaseHTTPRequestHandler):
                      "trace": traceback.format_exc()}, 500)
 
             token = uuid.uuid4().hex
+            # present results in natural display order (6,7,8,9,10,11-12)
+            disp = {g["name"]: i for i, g in enumerate(ALL_GRADES)}
+            all_results.sort(key=lambda r: disp.get(r["grade"], 99))
             ALL_CACHE[token] = {"grades": all_results}
 
             # ── Populate _grade_slots_cache so combined teacher TT works ─────
@@ -364,66 +639,56 @@ class Handler(BaseHTTPRequestHandler):
     @staticmethod
     def _extract_teacher_combined(teacher_name):
         """
-        Build a multi-grade personal TT by merging the teacher sheet from each
-        grade Excel file stored in ALL_CACHE.  This reads directly from the
-        already-written .xlsx files — no in-memory cache needed.
+        Build a single-sheet combined personal TT for a cross-grade teacher.
+        Uses in-memory cache if available (populated after Generate All Grades).
+        Falls back to reading individual Excel files if cache is empty.
         """
-        from openpyxl import load_workbook, Workbook
+        import excel_writer as _ew
+        out = os.path.join(WORKDIR, f"teacher_combined_{uuid.uuid4().hex[:8]}.xlsx")
 
-        # Find the most recent ALL_CACHE entry (last generate_all run)
+        # ── Try cache-based single-sheet approach first ───────────────────────
+        if _ew._grade_slots_cache:
+            from excel_writer import export_teacher_combined_xlsx
+            ok = export_teacher_combined_xlsx(teacher_name, out)
+            if ok:
+                return out
+
+        # ── Fallback: copy teacher sheets from individual grade Excel files ───
+        from openpyxl import load_workbook, Workbook
         if not ALL_CACHE:
             return None
         last_token = list(ALL_CACHE.keys())[-1]
         grades_info = ALL_CACHE[last_token]["grades"]
-
-        # Sheet name in the Excel file = re.sub special chars + truncate
-        sheet_name = re.sub(r'[\\/:*?"<>|]', '_', teacher_name)[:31]
+        sheet_name  = re.sub(r'[\\/:*?"<>|]', '_', teacher_name)[:31]
 
         wb_out = Workbook()
         wb_out.remove(wb_out.active)
-
-        GRADE_COLORS = {"6": "1A3660", "7": "7C3AED", "8": "0F7D59"}
+        from copy import copy as _copy
         any_written = False
 
         for gi in grades_info:
-            grade   = gi["grade"]
-            path    = gi["path"]
-            gnum    = grade.split()[-1]
-
+            path  = gi["path"]
+            gnum  = gi["grade"].split()[-1]
             if not os.path.exists(path):
                 continue
-
             wb_src = load_workbook(path)
             if sheet_name not in wb_src.sheetnames:
                 wb_src.close()
                 continue
-
-            # Copy the sheet into wb_out with a grade label
             ws_src  = wb_src[sheet_name]
             ws_dest = wb_out.create_sheet(f"Grade {gnum}")
-
-            # Copy all cells including styles
-            from copy import copy as _copy
             for row in ws_src.iter_rows():
                 for cell in row:
-                    new_cell = ws_dest.cell(row=cell.row, column=cell.column, value=cell.value)
+                    nc = ws_dest.cell(row=cell.row, column=cell.column, value=cell.value)
                     if cell.has_style:
-                        new_cell.font      = _copy(cell.font)
-                        new_cell.fill      = _copy(cell.fill)
-                        new_cell.border    = _copy(cell.border)
-                        new_cell.alignment = _copy(cell.alignment)
-                        new_cell.number_format = cell.number_format
-
-            # Copy merged cells
-            for merged in ws_src.merged_cells.ranges:
-                ws_dest.merge_cells(str(merged))
-
-            # Copy column widths and row heights
-            for col_letter, col_dim in ws_src.column_dimensions.items():
-                ws_dest.column_dimensions[col_letter].width = col_dim.width
-            for row_num, row_dim in ws_src.row_dimensions.items():
-                ws_dest.row_dimensions[row_num].height = row_dim.height
-
+                        nc.font = _copy(cell.font); nc.fill = _copy(cell.fill)
+                        nc.border = _copy(cell.border); nc.alignment = _copy(cell.alignment)
+            for m in ws_src.merged_cells.ranges:
+                ws_dest.merge_cells(str(m))
+            for cl, cd in ws_src.column_dimensions.items():
+                ws_dest.column_dimensions[cl].width = cd.width
+            for rn, rd in ws_src.row_dimensions.items():
+                ws_dest.row_dimensions[rn].height = rd.height
             ws_dest.sheet_view.showGridLines = False
             ws_dest.page_setup.orientation   = "landscape"
             wb_src.close()
@@ -431,8 +696,6 @@ class Handler(BaseHTTPRequestHandler):
 
         if not any_written:
             return None
-
-        out = os.path.join(WORKDIR, f"teacher_combined_{uuid.uuid4().hex[:8]}.xlsx")
         wb_out.save(out)
         return out
 
@@ -451,6 +714,7 @@ INDEX_HTML = """<!DOCTYPE html>
   --brand:#1a3660;--brand2:#2563a8;--brand-light:#dbeafe;
   --accent:#0f7d59;--warn:#b45309;
   --g6:#1a3660;--g7:#7c3aed;--g8:#0f7d59;
+  --g9:#b45309;--g10:#be185d;--g11:#0e7490;
   --maths-bg:#eff6ff;--merge-bg:#f3e8ff;--rel-bg:#ecfdf5;--pe-bg:#fef9c3;--break-bg:#fefce8;
 }
 *{box-sizing:border-box;margin:0;padding:0}
@@ -482,6 +746,18 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .setup-wrap td{border:1px solid var(--line);padding:4px 7px}
 .setup-wrap td.subj{font-weight:500;white-space:nowrap;min-width:130px}
 .setup-wrap td.tchr input{width:186px}
+.setup-wrap td.subj input{width:140px}
+.setup-wrap td.del{width:30px;text-align:center;padding:2px}
+.row-del{background:#fef2f2;color:#b42318;border:1px solid #fecaca;border-radius:6px;
+         padding:2px 7px;font-size:13px;line-height:1;font-weight:700}
+.row-del:hover{background:#fee2e2}
+.add-row{background:var(--brand-light);color:var(--brand);border:1px dashed #9bb8dd;
+         border-radius:8px;padding:6px 12px;font-size:12.5px;font-weight:600;margin-top:7px}
+.add-row:hover{background:#e4eefb}
+.reset-btn{background:#f8fafc;color:var(--muted);border:1px solid var(--line);
+           border-radius:7px;padding:5px 11px;font-size:12px}
+.reset-btn:hover{color:var(--brand)}
+.new-row td{background:#f7fcf7}
 .divider{height:1px;background:var(--line);margin:12px 0}
 .summary-row{display:flex;gap:20px;flex-wrap:wrap;margin-bottom:12px}
 .summary-grade{font-size:12px;line-height:1.8}
@@ -492,11 +768,17 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .gtact-g6{background:var(--g6)!important;color:#fff!important;border-color:var(--g6)!important}
 .gtact-g7{background:var(--g7)!important;color:#fff!important;border-color:var(--g7)!important}
 .gtact-g8{background:var(--g8)!important;color:#fff!important;border-color:var(--g8)!important}
+.gtact-g9{background:var(--g9)!important;color:#fff!important;border-color:var(--g9)!important}
+.gtact-g10{background:var(--g10)!important;color:#fff!important;border-color:var(--g10)!important}
+.gtact-g11{background:var(--g11)!important;color:#fff!important;border-color:var(--g11)!important}
 .class-tabs{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:10px}
 .class-tab{padding:4px 10px;border-radius:7px;font-size:12px;cursor:pointer;border:1px solid var(--line);background:#f8fafc;color:var(--muted);transition:all .12s}
 .ct-g6.active{background:#dbeafe;border-color:var(--g6);color:var(--g6);font-weight:600}
 .ct-g7.active{background:#ede9fe;border-color:var(--g7);color:var(--g7);font-weight:600}
 .ct-g8.active{background:#d1fae5;border-color:var(--g8);color:var(--g8);font-weight:600}
+.ct-g9.active{background:#fef3c7;border-color:var(--g9);color:var(--g9);font-weight:600}
+.ct-g10.active{background:#fce7f3;border-color:var(--g10);color:var(--g10);font-weight:600}
+.ct-g11.active{background:#cffafe;border-color:var(--g11);color:var(--g11);font-weight:600}
 .grade-section{display:none}.grade-section.vis{display:block}
 .tt-grid table{border-collapse:collapse;width:100%;font-size:12px}
 .tt-grid th{padding:7px 9px;border:1px solid #1e4a8a;font-family:'Fraunces',serif;font-size:13px;color:#fff}
@@ -524,7 +806,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 <header>
   <div>
     <div class="logo">Lyceum Timetable Generator</div>
-    <div class="sub">Grades 6 · 7 · 8 — cross-grade shared teacher conflict prevention</div>
+    <div class="sub">Grades 6 – 12 — cross-grade shared-teacher conflict prevention</div>
   </div>
   <div class="badge">v2</div>
 </header>
@@ -542,20 +824,20 @@ button:disabled{opacity:.4;cursor:not-allowed}
 
 <div class="card" id="setupCard" style="display:none">
   <div class="card-title"><span class="step">2</span> Edit Teachers &amp; Periods</div>
-  <div class="card-sub">Change teacher <b>name</b> or <b>period count</b> per class. Set 0 to skip.</div>
+  <div class="card-sub">Edit a teacher <b>name</b>, <b>subject</b> or <b>period count</b> per class. Use <b>&#10005;</b> to delete a row and <b>&#10133; Add</b> to create a new subject/teacher. Set a period to 0 to skip a class.</div>
   <div id="setupArea"></div>
   <div class="divider"></div>
   <div class="row" style="margin-top:4px">
     <button class="btn-primary" id="genBtn">&#9654; Generate <span id="genLabel"></span></button>
-    <button class="btn-all" id="genAllBtn">&#9654;&#9654; Generate All Grades (6 + 7 + 8)</button>
+    <button class="btn-all" id="genAllBtn">&#9654;&#9654; Generate All Grades (6–12)</button>
     <span id="genMsg" class="muted" style="font-size:12px"></span>
   </div>
-  <div class="hint"><b>Generate All Grades</b> uses a shared teacher-busy set across Grade 6&#8594;7&#8594;8, so option-block teachers (Sakna, Pulakshika, EFF Speech, Religion&#8230;) are never double-booked between grades.</div>
+  <div class="hint"><b>Generate All Grades</b> schedules all grades (6&#8594;12) against one shared teacher-busy set, so any teacher shared between grades (e.g. Grade 9 &amp; 10 staff, or Mr. Radun across 9/10/11&#8211;12) is never double-booked.</div>
 </div>
 <div id="errBox"></div>
 
 <div class="card" id="resultCard" style="display:none">
-  <div class="card-title"><span class="step">3</span> Result &mdash; Weekly Timetables (Grade 6 · 7 · 8)</div>
+  <div class="card-title"><span class="step">3</span> Result &mdash; Weekly Timetables (Grades 6–12)</div>
   <div class="summary-row" id="summaryRow"></div>
   <div class="grade-tabs" id="gradeTabs"></div>
   <div class="dl-bar" id="dlBar">
@@ -573,7 +855,10 @@ button:disabled{opacity:.4;cursor:not-allowed}
 </main>
 <script>
 var SETUP=null, RESULT=null, AG=null, AC=null;
-var GCOL={'Grade 6':'g6','Grade 7':'g7','Grade 8':'g8'};
+var EDITS={};            // grade name -> edited setup (persists across grade switches)
+var NEWID=1;             // counter for new regular-row ids
+var LOADED_GRADE=null;   // grade currently shown in the editor
+var GCOL={'Grade 6':'g6','Grade 7':'g7','Grade 8':'g8','Grade 9':'g9','Grade 10':'g10','Grade 11-12 AL':'g11'};
 var $=function(s){return document.querySelector(s)};
 var $$=function(s){return document.querySelectorAll(s)};
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
@@ -592,60 +877,143 @@ function clearErr(){$('#errBox').innerHTML=''}
   $('#gradeSel').innerHTML=j.grades.map(function(g){return'<option>'+esc(g)+'</option>'}).join('');
 })();
 
-$('#loadBtn').onclick=async function(){
-  clearErr();$('#loadMsg').textContent='Loading\u2026';
+function cacheCurrent(){
+  if(SETUP && LOADED_GRADE){ EDITS[LOADED_GRADE]=readSetupFromDOM(LOADED_GRADE); }
+}
+
+async function loadGrade(grade, forceFresh){
+  clearErr(); $('#loadMsg').textContent='Loading\u2026';
   try{
-    SETUP=await api('/api/setup?grade='+encodeURIComponent($('#gradeSel').value));
+    if(forceFresh) delete EDITS[grade];
+    if(EDITS[grade]){ SETUP=EDITS[grade]; }       // restore previous edits
+    else            { SETUP=await api('/api/setup?grade='+encodeURIComponent(grade)); }
+    LOADED_GRADE=grade;
     renderSetup();
     $('#setupCard').style.display='';
     $('#genLabel').textContent=SETUP.grade;
-    $('#loadMsg').textContent=SETUP.regular_rows.length+' subjects \u00b7 '+SETUP.classes.length+' classes loaded.';
+    var edited=EDITS[grade]?' (your edits)':'';
+    $('#loadMsg').textContent=SETUP.regular_rows.length+' subjects \u00b7 '+SETUP.classes.length+' classes loaded'+edited+'.';
   }catch(e){showErr('Load failed: '+e.message);$('#loadMsg').textContent=''}
+}
+
+$('#loadBtn').onclick=function(){
+  cacheCurrent();                  // keep edits from the grade we're leaving
+  loadGrade($('#gradeSel').value);
 };
 
 function renderSetup(){
   if(!SETUP)return;
   var cls=SETUP.classes;
-  var h='<div class="setup-wrap"><table><thead><tr><th style="text-align:left">Subject</th><th style="text-align:left">Teacher</th>'+
-        cls.map(function(c){return'<th>'+c+'</th>'}).join('')+'</tr></thead><tbody>';
-  SETUP.regular_rows.forEach(function(r){
-    h+='<tr data-rid="'+r.id+'"><td class="subj">'+esc(r.subject)+'</td>'+
-       '<td class="tchr"><input type="text" data-k="teacher" value="'+ea(r.teacher)+'"></td>'+
-       cls.map(function(c){return'<td><input type="number" min="0" max="40" data-cls="'+c+'" value="'+(r.periods[c]||0)+'"></td>'}).join('')+
-       '</tr>';
-  });
+  var h='<div class="row" style="justify-content:space-between;align-items:center;margin-bottom:6px">'+
+        '<b style="font-size:13px">Subjects &amp; teachers</b>'+
+        '<button class="reset-btn" id="resetBtn" title="Discard edits and reload original values">\u21ba Reset to defaults</button></div>';
+  h+='<div class="setup-wrap"><table><thead><tr><th></th>'+
+     '<th style="text-align:left">Subject</th><th style="text-align:left">Teacher</th>'+
+     cls.map(function(c){return'<th>'+c+'</th>'}).join('')+'</tr></thead><tbody id="regBody">';
+  SETUP.regular_rows.forEach(function(r){ h+=regRowHTML(r,cls); });
   h+='</tbody></table></div>';
+  h+='<button class="add-row" id="addRegBtn">\u2795 Add subject / teacher</button>';
+
   if(SETUP.blocks.length){
-    h+='<div style="margin-top:12px"><b style="font-size:13px">Shared Blocks</b> <span class="muted" style="font-size:11.5px">&mdash; teacher names editable; period count fixed by block</span></div>';
+    h+='<div style="margin-top:16px"><b style="font-size:13px">Shared Blocks</b> '+
+       '<span class="muted" style="font-size:11.5px">&mdash; option subjects taught at one shared slot; add or remove options as needed. These teachers are shared across Grades 6\u20138 \u2014 if you rename one, rename it the same way in each grade.</span></div>';
     SETUP.blocks.forEach(function(b){
+      var isRel=(b.type==='religion_block');
       h+='<div style="margin-top:8px"><span class="pill">'+esc(b.label)+'</span>'+
-         '<div class="setup-wrap" style="max-height:none;margin-top:5px"><table><tbody>';
-      b.teachers.forEach(function(t,i){
-        var cov=t.covers?' <span class="muted">('+esc(t.covers)+')</span>':'';
-        h+='<tr data-bid="'+b.id+'" data-ti="'+i+'"><td class="subj">'+esc(t.subject)+cov+'</td>'+
-           '<td class="tchr"><input type="text" data-bk="teacher" value="'+ea(t.teacher)+'"></td></tr>';
-      });
-      h+='</tbody></table></div></div>';
+         '<div class="setup-wrap" style="max-height:none;margin-top:5px"><table><thead><tr>'+
+         '<th></th><th style="text-align:left">Subject</th><th style="text-align:left">Teacher</th>'+
+         (isRel?'<th style="text-align:left">Covers</th>':'')+
+         '</tr></thead><tbody id="blk_'+b.id+'">';
+      b.teachers.forEach(function(t){ h+=blkRowHTML(b,t); });
+      h+='</tbody></table></div>'+
+         '<button class="add-row" data-addblk="'+b.id+'">\u2795 Add option teacher</button></div>';
     });
   }
   $('#setupArea').innerHTML=h;
+  wireSetup();
 }
 
-function collectPayload(gradeName){
-  var rr=[];
-  $$('#setupArea tr[data-rid]').forEach(function(tr){
-    var periods={};
-    tr.querySelectorAll('input[data-cls]').forEach(function(inp){periods[inp.dataset.cls]=+inp.value||0});
-    rr.push({id:+tr.dataset.rid,teacher:tr.querySelector('input[data-k=teacher]').value,periods:periods});
-  });
-  var bm={};
-  $$('#setupArea tr[data-bid]').forEach(function(tr){
-    var bid=+tr.dataset.bid,ti=+tr.dataset.ti;
-    (bm[bid]=bm[bid]||[])[ti]=tr.querySelector('input[data-bk=teacher]').value;
-  });
-  var blocks=Object.keys(bm).map(function(k){return{id:+k,teachers:bm[k]}});
-  return{grade:gradeName||SETUP.grade,regular_rows:rr,blocks:blocks};
+function regRowHTML(r,cls,isNew){
+  return '<tr data-rid="'+ea(r.id)+'" data-room="'+ea(r.room||'R??')+'"'+
+         ' data-sd="'+(r.same_day?'1':'0')+'" data-a1="'+(r.all_1period?'1':'0')+'"'+
+         ' data-mg="'+ea(r.merge_groups||'')+'"'+(isNew?' class="new-row"':'')+'>'+
+         '<td class="del"><button class="row-del" title="Delete this subject/teacher">\u2715</button></td>'+
+         '<td class="subj"><input type="text" data-k="subject" placeholder="Subject" value="'+ea(r.subject||'')+'"></td>'+
+         '<td class="tchr"><input type="text" data-k="teacher" placeholder="Teacher name" value="'+ea(r.teacher||'')+'"></td>'+
+         cls.map(function(c){return'<td><input type="number" min="0" max="40" data-cls="'+c+'" value="'+((r.periods&&r.periods[c])||0)+'"></td>'}).join('')+
+         '</tr>';
 }
+
+function blkRowHTML(b,t,isNew){
+  var isRel=(b.type==='religion_block');
+  return '<tr class="btr'+(isNew?' new-row':'')+'" data-room="'+ea(t.room||'R??')+'">'+
+         '<td class="del"><button class="row-del" title="Remove this option">\u2715</button></td>'+
+         '<td class="subj"><input type="text" data-bk="subject" placeholder="Subject" value="'+ea(t.subject||'')+'"></td>'+
+         '<td class="tchr"><input type="text" data-bk="teacher" placeholder="Teacher name" value="'+ea(t.teacher||'')+'"></td>'+
+         (isRel?'<td><input type="text" data-bk="covers" placeholder="All classes" value="'+ea(t.covers||'')+'"></td>':'')+
+         '</tr>';
+}
+
+function wireSetup(){
+  var area=$('#setupArea');
+  // delete (event delegation)
+  area.onclick=function(ev){
+    var del=ev.target.closest('.row-del');
+    if(del){ var tr=del.closest('tr'); if(tr) tr.remove(); return; }
+    var addb=ev.target.closest('[data-addblk]');
+    if(addb){
+      var bid=addb.getAttribute('data-addblk');
+      var b=SETUP.blocks.filter(function(x){return x.id===bid})[0];
+      var tb=$('#blk_'+bid);
+      tb.insertAdjacentHTML('beforeend', blkRowHTML(b,{subject:'',teacher:'',covers:'',room:'R??'},true));
+      return;
+    }
+  };
+  var addReg=$('#addRegBtn');
+  if(addReg) addReg.onclick=function(){
+    var id='rnew'+(NEWID++);
+    $('#regBody').insertAdjacentHTML('beforeend',
+      regRowHTML({id:id,subject:'',teacher:'',room:'R??',periods:{}},SETUP.classes,true));
+  };
+  var rb=$('#resetBtn');
+  if(rb) rb.onclick=async function(){
+    delete EDITS[SETUP.grade];
+    await loadGrade(SETUP.grade,true);
+  };
+}
+
+function readSetupFromDOM(gradeName){
+  var classes=SETUP.classes, regular=[];
+  $$('#regBody tr').forEach(function(tr){
+    var subj=tr.querySelector('input[data-k=subject]').value.trim();
+    var tch =tr.querySelector('input[data-k=teacher]').value.trim();
+    var periods={},any=false;
+    tr.querySelectorAll('input[data-cls]').forEach(function(inp){
+      var v=+inp.value||0; periods[inp.dataset.cls]=v; if(v>0)any=true; });
+    if(!subj && !tch && !any) return;       // drop fully-empty rows
+    regular.push({id:tr.dataset.rid||('r'+regular.length),teacher:tch,subject:subj,
+      room:tr.dataset.room||'R??',periods:periods,
+      same_day:tr.dataset.sd==='1',all_1period:tr.dataset.a1==='1',
+      merge_groups:tr.dataset.mg||''});
+  });
+  var blocks=[];
+  SETUP.blocks.forEach(function(b){
+    var teachers=[];
+    $$('#blk_'+b.id+' tr.btr').forEach(function(tr){
+      var tch=tr.querySelector('input[data-bk=teacher]').value.trim();
+      var subj=tr.querySelector('input[data-bk=subject]').value.trim();
+      if(!tch && !subj) return;
+      var o={teacher:tch,subject:subj,room:tr.dataset.room||'R??'};
+      var cov=tr.querySelector('input[data-bk=covers]');
+      if(cov) o.covers=cov.value.trim();
+      teachers.push(o);
+    });
+    blocks.push({id:b.id,type:b.type,label:b.label,teachers:teachers});
+  });
+  return {grade:gradeName||SETUP.grade,classes:classes,regular_rows:regular,blocks:blocks};
+}
+
+function collectPayload(gradeName){ return readSetupFromDOM(gradeName); }
 
 function setBusy(b,msg){
   $('#genBtn').disabled=b;$('#genAllBtn').disabled=b;$('#loadBtn').disabled=b;
@@ -654,6 +1022,7 @@ function setBusy(b,msg){
 
 $('#genBtn').onclick=async function(){
   if(!SETUP)return;
+  cacheCurrent();
   clearErr();setBusy(true,'Generating '+SETUP.grade+'\u2026');
   try{
     var r=await api('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collectPayload())});
@@ -665,7 +1034,8 @@ $('#genBtn').onclick=async function(){
 
 $('#genAllBtn').onclick=async function(){
   clearErr();setBusy(true,'Scheduling Grade 6 \u2192 7 \u2192 8 with shared teacher-busy set\u2026');
-  var grades=SETUP?[collectPayload()]:[];
+  cacheCurrent();                              // capture edits of the visible grade
+  var grades=Object.keys(EDITS).map(function(g){return EDITS[g]});  // all edited grades; the rest use defaults
   try{
     var r=await api('/api/generate_all',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({grades:grades})});
     RESULT={token:r.token,mode:'all',grades:r.grades};

@@ -1399,10 +1399,27 @@ def generate_workbook(grp, excel_path, log_callback=None, **kwargs):
         parts=cls.split()
         CLASS_SHORT[cls]=" ".join(parts[2:]) if len(parts)>=3 else (parts[-1] if parts else cls)
 
-    # Schedule
+    # Schedule (best-of-N; name-based teacher tracking; cross-grade shared busy)
     log("  Running constraint-based scheduler …")
     from scheduler import schedule_all
-    all_slots, conflicts, double_booked = schedule_all(CLASS_SUBJECTS)
+    tid_to_name = {tid: ALL_TEACHERS[tid][0] for tid in ALL_TEACHERS}
+    shared_busy = kwargs.get("shared_teacher_busy", None)
+    base_busy   = set(shared_busy) if shared_busy is not None else None
+    max_attempts = kwargs.get("max_attempts", 60)
+
+    best = None
+    for attempt in range(max_attempts):
+        trial_busy = set(base_busy) if base_busy is not None else None
+        sl, cf, db = schedule_all(CLASS_SUBJECTS, shared_teacher_busy=trial_busy,
+                                  tid_to_name=tid_to_name, attempt=attempt)
+        score = (sum(cf.values()), len(db))
+        if best is None or score < best[0]:
+            best = (score, sl, cf, db, trial_busy)
+        if score == (0, 0):
+            break
+    _, all_slots, conflicts, double_booked, trial_busy = best
+    if shared_busy is not None and trial_busy is not None:
+        shared_busy.clear(); shared_busy.update(trial_busy)
 
     for cls in CLASSES:
         conf=sum(1 for (c,_),v in conflicts.items() if c==cls and v>0)
@@ -1434,46 +1451,71 @@ def generate_workbook(grp, excel_path, log_callback=None, **kwargs):
     ws_log.delete_rows(1,200)
     write_conflict_log(ws_log,conflicts,double_booked,now_str)
 
-    # Teacher personal sheets
+    # Teacher personal sheets — one sheet per unique teacher NAME, aggregating
+    # every ID that name uses (covers teachers who span PED + NAT streams) and
+    # every class they teach.
     log("  Writing teacher personal timetables …")
     CORE={"Setup","Conflict Log","Teacher Overview"}|set(CLASSES.keys())
-    old_names={tn[:31] for _,tn,_,_ in teachers}
-    new_names={ALL_TEACHERS[tid][0][:31] for tid in ALL_TEACHERS}
+    name_to_tids={}; name_subjects={}; name_stream={}
+    for tid,(uname,tsubj,stream) in ALL_TEACHERS.items():
+        name_to_tids.setdefault(uname,set()).add(tid)
+        name_subjects.setdefault(uname,[])
+        if tsubj and tsubj not in name_subjects[uname]:
+            name_subjects[uname].append(tsubj)
+        name_stream.setdefault(uname,stream)
+    keep_names={n[:31] for n in name_to_tids}
     for sn in list(wb.sheetnames):
-        if sn not in CORE and sn not in (old_names|new_names): del wb[sn]
+        if sn not in CORE and sn not in keep_names: del wb[sn]
 
-    for stream in streams:
+    all_grades=set()
+    for cls in CLASSES:
+        m=re.search(r'\b(\d{1,2})\b',cls)
+        if m: all_grades.add(int(m.group(1)))
+    mg=min(all_grades) if all_grades else 0
+    sl_lvl="Lower Secondary" if mg<=8 else ("Upper Secondary" if mg<=11 else "Advanced Level")
+
+    for uname,tids in name_to_tids.items():
+        sn=uname[:31]
+        if sn in wb.sheetnames: del wb[sn]
+        ws_t=wb.create_sheet(sn)
+        stream=name_stream.get(uname,streams[0])
         hc=grp["stream_colors"].get(stream,"1F4E79")
-        my_classes=[c for c,s in CLASSES.items() if s==stream]
-        grades=set()
-        for cls in my_classes:
-            m=re.search(r'\b(\d{1,2})\b',cls)
-            if m: grades.add(int(m.group(1)))
-        mg=min(grades) if grades else 0
-        sl="Lower Secondary" if mg<=8 else ("Upper Secondary" if mg<=11 else "Advanced Level")
-
-        for tid,tname,tsubj,_ in STREAM_TEACHERS[stream]:
-            uname=ALL_TEACHERS.get(tid,(tname,tsubj,""))[0]
-            sn=uname[:31]
-            if tname[:31] in wb.sheetnames and tname[:31]!=sn: del wb[tname[:31]]
-            if sn in wb.sheetnames: del wb[sn]
-            ws_t=wb.create_sheet(sn)
-            t_sched={}
-            for cls in my_classes:
-                for d in range(1,6):
-                    for si,p in enumerate(PERIOD_SNS):
-                        e=all_slots[cls][d][p]
-                        if e and e[2]==tid:
-                            t_sched[(d-1,si)]=cls
-            write_teacher_sheet(ws_t,tid,uname,tsubj,stream,sl,
-                                 t_sched,CLASS_SHORT,now_str,hc)
-            log(f"    {uname:<30} ({len(t_sched)} periods/wk)")
+        t_sched={}
+        for cls in CLASSES:                      # scan ALL classes (both streams)
+            for d in range(1,6):
+                for si,p in enumerate(PERIOD_SNS):
+                    e=all_slots[cls][d][p]
+                    if e and e[2] in tids:
+                        key=(d-1,si)
+                        t_sched[key]=(t_sched[key]+"+"+cls) if key in t_sched else cls
+        tsubj=" / ".join(name_subjects.get(uname,[])) or ""
+        write_teacher_sheet(ws_t,list(tids)[0],uname,tsubj,stream,sl_lvl,
+                             t_sched,CLASS_SHORT,now_str,hc)
+        log(f"    {uname:<30} ({len(t_sched)} periods/wk)")
 
     wb.save(excel_path)
     log(f"  ✅  Saved: {os.path.basename(excel_path)}")
     if kwargs.get("return_slots"):
         return len(conflicts), len(double_booked), all_slots
     return len(conflicts), len(double_booked)
+
+
+def _subject_allowed(cls_name, subj_name, note):
+    """Decide whether a subject applies to a class, honouring the Setup 'Notes'
+    restrictions for BOTH streams (Science-only / Commerce-only), plus the
+    convention that Combined Maths is a science-stream subject."""
+    cl = (cls_name or "").lower()
+    nt = (note or "").lower()
+    sn = (subj_name or "").lower()
+    sci_note = any(k in nt for k in ("sci only", "sci a&b", "nat sci only", "science only"))
+    com_note = any(k in nt for k in ("com only", "commerce only", "nat com only", "ped com only"))
+    if "combined maths" in sn:          # Combined Maths → science streams only
+        return "sci" in cl
+    if sci_note:
+        return "sci" in cl
+    if com_note:
+        return "com" in cl
+    return True
 
 
 def _read_subjects_from_setup(ws, grp):
@@ -1505,28 +1547,17 @@ def _read_subjects_from_setup(ws, grp):
 
     if len(streams)==1:
         r0=find_code_header(ws,1)
-        raw=read_subj_rows(ws,1,2,3,4,5,6,r0)
-        raw=[s for s in raw if s[3]>0]
-        for cls in CLASSES: subjects_out[cls]=raw
+        raw=[s for s in read_subj_rows(ws,1,2,3,4,5,6,r0) if s[3]>0]
+        for cls in CLASSES:
+            subjects_out[cls]=[s for s in raw if _subject_allowed(cls,s[1],s[5])]
     else:
         r0_ped=find_code_header(ws,1)
         r0_nat=find_code_header(ws,9)
         ped_raw=[s for s in read_subj_rows(ws,1,2,3,4,5,6,r0_ped) if s[3]>0]
         nat_raw=[s for s in read_subj_rows(ws,9,10,11,12,13,14,r0_nat) if s[3]>0]
         for cls,stream in CLASSES.items():
-            if stream=="PED":
-                cls_lower=cls.lower()
-                is_sci="sci" in cls_lower
-                is_com="com" in cls_lower
-                filtered=[]
-                for s in ped_raw:
-                    notes=s[5].lower() if len(s)>5 else ""
-                    if is_com and ("sci a&b" in notes or "sci only" in notes): continue
-                    if is_sci and ("commerce only" in notes or "com only" in notes): continue
-                    filtered.append(s)
-                subjects_out[cls]=filtered
-            else:
-                subjects_out[cls]=nat_raw
+            raw = ped_raw if stream=="PED" else nat_raw
+            subjects_out[cls]=[s for s in raw if _subject_allowed(cls,s[1],s[5])]
     return subjects_out
 
 
@@ -1779,29 +1810,149 @@ def get_teacher_combined_sched(teacher_name):
 
 def export_teacher_combined_xlsx(teacher_name, out_path):
     """
-    Build a single .xlsx with one sheet per grade (Grade 6 / Grade 7 / Grade 8)
-    for a teacher who teaches across multiple grades.
-    Uses _grade_slots_cache populated after generate_all in web_app.py.
-
-    Strategy: scan all_slots directly for this teacher — no subject_rows parsing
-    needed.  This is robust regardless of how rows are stored (tuple vs dict).
-    The teacher_name here is the sheet-safe name from the dropdown (same as
-    re.sub special chars → '_'), which matches what the scheduler stores in
-    slots because web_app collect_teacher_names + scheduler both use the raw
-    name string from data.py.
+    Build a single .xlsx with ONE sheet containing all grades stacked vertically.
+    Header block (title, teacher info) appears once at the top.
+    Each grade gets a labelled timetable grid stacked below.
     """
     from openpyxl import Workbook
+    from openpyxl.styles import (Font, PatternFill, Alignment, Border, Side,
+                                  GradientFill)
     from scheduler import PERIOD_SNS
     from datetime import datetime
-    import re as _re
 
     now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
-    GRADE_COLORS = {"6": "1A3660", "7": "7C3AED", "8": "0F7D59"}
 
-    wb_out = Workbook()
-    wb_out.remove(wb_out.active)
+    GRADE_COLORS = {"6": "1A3660", "7": "7B2D8B", "8": "0F7D59"}  # navy / purple / green
 
-    any_written = False
+    BLACK  = "000000"
+    WHITE  = "FFFFFF"
+    TITLE_BG  = "1E4E79"
+    LABEL_BG  = "D9E2F3"
+    EMP_BG    = "B4C6E7"
+    NOTES_BG  = "DEEAF6"
+    BREAK_BG  = "C0C0C0"
+
+    _thin = Side(style="thin", color=BLACK)
+    _none = Side(style=None)
+    ALL   = Border(left=_thin, right=_thin, top=_thin, bottom=_thin)
+    TB    = Border(top=_thin, bottom=_thin)
+    RTB   = Border(right=_thin, top=_thin, bottom=_thin)
+
+    def _f(bold=False, sz=12, color=BLACK, name="Calibri", italic=False):
+        return Font(name=name, bold=bold, size=sz, color=color, italic=italic)
+
+    def _fill(hex_color):
+        return PatternFill("solid", start_color=hex_color)
+
+    def _aln(h="left", v="center", wrap=False):
+        return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    ws = wb.create_sheet("Personal Timetable")
+    ws.sheet_view.showGridLines = False
+    ws.page_setup.orientation   = "landscape"
+
+    # Column widths (same as individual sheet)
+    ws.column_dimensions["A"].width = 8.22
+    ws.column_dimensions["B"].width = 39.44
+    ws.column_dimensions["C"].width = 30.33
+    ws.column_dimensions["D"].width = 28.33
+    ws.column_dimensions["E"].width = 31.11
+    ws.column_dimensions["F"].width = 28.33
+    ws.column_dimensions["G"].width = 26.66
+    ws.column_dimensions["H"].width = 8.22
+
+    def put(r, c, val="", font=None, fill=None, aln=None, border=ALL):
+        ce = ws.cell(row=r, column=c, value=val)
+        if font:   ce.font      = font
+        if fill:   ce.fill      = fill
+        if aln:    ce.alignment = aln
+        if border: ce.border    = border
+        return ce
+
+    def merge_put(r, c1, c2, val="", font=None, fill=None, aln=None, h=None):
+        ws.merge_cells(start_row=r, start_column=c1, end_row=r, end_column=c2)
+        ce = ws.cell(row=r, column=c1, value=val)
+        if font: ce.font      = font
+        if fill: ce.fill      = fill
+        if aln:  ce.alignment = aln
+        if h:    ws.row_dimensions[r].height = h
+        return ce
+
+    # ════════════════════════════════════════════════════════
+    # HEADER BLOCK (rows 1-9) — written once
+    # ════════════════════════════════════════════════════════
+    ws.row_dimensions[1].height = 55.95
+    merge_put(1, 1, 7,
+        "SUBJECT TEACHER TIMETABLE\n"
+        "(Prepared as per the official Lyceum International School format)",
+        font=_f(bold=False, sz=12, color=WHITE),
+        fill=_fill(TITLE_BG),
+        aln=_aln("center","center",wrap=True))
+
+    ws.row_dimensions[2].height = 55.95
+    merge_put(2, 2, 5,
+        "LYCEUM INTERNATIONAL SCHOOL - Kurunegala",
+        font=_f(bold=True, sz=13.5, color=BLACK),
+        aln=_aln("center","center"))
+
+    ws.row_dimensions[3].height = 19.95
+
+    ws.row_dimensions[4].height = 30.0
+    put(4, 2, "Teacher's Name",
+        font=_f(bold=True, sz=12), fill=_fill(LABEL_BG), aln=_aln("left","center"))
+    put(4, 3, teacher_name,
+        font=_f(sz=12), aln=_aln("left","center"))
+    put(4, 4, "Employee Number",
+        font=_f(bold=True, sz=12, color=WHITE), fill=_fill(EMP_BG),
+        aln=_aln("center","center"),
+        border=Border(right=_thin, top=_thin, bottom=_thin))
+    put(4, 5, "", font=_f(sz=12), aln=_aln("left","center"))
+
+    ws.row_dimensions[5].height = 27.0
+    put(5, 2, "Subjects Taught",
+        font=_f(bold=True, sz=12), fill=_fill(LABEL_BG), aln=_aln("left","center"))
+    # subject filled later after collecting from all grades
+    subj_cell = put(5, 3, "", font=_f(sz=12), aln=_aln("left","center"))
+
+    ws.row_dimensions[6].height = 57.0
+    put(6, 2,
+        "Section to which the Teacher Belong to:\n"
+        "[Primary/Middle School/Lower Secondary/Upper Secondary]",
+        font=_f(bold=True, sz=12), fill=_fill(LABEL_BG),
+        aln=_aln("left","center",wrap=True))
+    put(6, 3, "Lower Secondary", font=_f(sz=12), aln=_aln("left","center",wrap=True))
+
+    ws.row_dimensions[7].height = 19.95
+    put(7, 2, "Supervising Sectional Head's Name",
+        font=_f(bold=True, sz=12), fill=_fill(LABEL_BG), aln=_aln("left","center"))
+    put(7, 3, "", font=_f(sz=12), aln=_aln("left","center"))
+    put(7, 4, "Employee Number",
+        font=_f(bold=True, sz=12, color=WHITE), fill=_fill(EMP_BG),
+        aln=_aln("center","center"),
+        border=Border(right=_thin, top=_thin, bottom=_thin))
+    put(7, 5, "", font=_f(sz=12), aln=_aln("left","center"))
+
+    SLOT_DATA = [
+        (1,  "7.40 a.m. - 8.15 a.m.\xa0",   "",                 False, 19.95),
+        (2,  "8.15 a.m. - 8.30 a.m. ",        "Register Marking", True,  22.05),
+        (3,  "8.30 a.m. - 9.10 a.m.\xa0",   "",                 False, 19.05),
+        (4,  "9.10 a.m. - 9.50 a.m.\xa0",   "",                 False, 19.95),
+        (5,  "9.50 a.m. - 10.25 a.m.\xa0",  "",                 False, 19.05),
+        (6,  "10.25 a.m. - 10.50 a.m.",        "Interval",         True,  22.95),
+        (7,  "10.50 a.m. - 10.55 a.m. ",       "Seiri Time",       True,  22.05),
+        (8,  "10.55 a.m. - 11.35 a.m.\xa0",  "",                 False, 19.95),
+        (9,  "11.35 a.m. - 12.15 p.m.\xa0",  "",                 False, 19.05),
+        (10, "12.15 p.m. - 1.00 p.m.\xa0",   "",                 False, 19.05),
+        (12, "1.00 p.m. - 1.45 p.m.\xa0",    "",                 False, 24.0),
+    ]
+
+    # ════════════════════════════════════════════════════════
+    # Collect grade data
+    # ════════════════════════════════════════════════════════
+    grade_data = []   # list of (gnum, gcolor, t_sched, t_subj)
+    all_subj   = []
 
     for grade_name in sorted(_grade_slots_cache.keys()):
         cache     = _grade_slots_cache[grade_name]
@@ -1811,10 +1962,10 @@ def export_teacher_combined_xlsx(teacher_name, out_path):
         gnum      = grade_name.split()[-1]
         hc        = GRADE_COLORS.get(gnum, "1A3660")
 
-        t_sched = {}   # (day0, pidx) -> label
+        t_sched = {}
         t_subj  = ""
 
-        # ── 1. Scan all_slots directly for this teacher (regular + merge slots) ──
+        # Scan all_slots directly
         for cls in classes:
             for d in range(1, 6):
                 for pidx, p in enumerate(PERIOD_SNS):
@@ -1823,9 +1974,7 @@ def export_teacher_combined_xlsx(teacher_name, out_path):
                         continue
                     slot_teacher = str(e[1]) if len(e) > 1 else ""
                     slot_subj    = str(e[0]) if len(e) > 0 else ""
-
                     if slot_teacher == teacher_name:
-                        # Regular subject slot
                         key = (d - 1, pidx)
                         existing = t_sched.get(key, "")
                         if cls not in existing:
@@ -1833,23 +1982,16 @@ def export_teacher_combined_xlsx(teacher_name, out_path):
                         if not t_subj and slot_subj:
                             t_subj = slot_subj
 
-        # ── 2. Handle RELIGION_BLOCK — find slot + look up which class this
-        #       teacher covers from subject_rows ──────────────────────────────
-        rel_key   = None
-        rel_cover = ""
-        rel_subj  = ""
-
+        # Religion block
+        rel_key, rel_cover, rel_subj = None, "", ""
         for cls in classes:
             for d in range(1, 6):
                 for pidx, p in enumerate(PERIOD_SNS):
                     e = all_slots[cls][d][p]
                     if e and e[1] == "RELIGION_BLOCK":
-                        rel_key = (d - 1, pidx)
-                        break
-                if rel_key:
-                    break
-            if rel_key:
-                break
+                        rel_key = (d - 1, pidx); break
+                if rel_key: break
+            if rel_key: break
 
         if rel_key:
             for row in subject_rows:
@@ -1860,28 +2002,113 @@ def export_teacher_combined_xlsx(teacher_name, out_path):
                         rel_cover = tinfo.get("covers", "")
                         rel_subj  = tinfo.get("subject", "")
                         break
-                if rel_cover:
-                    break
-
-            if rel_cover:
-                # Only add religion slot if not already captured above
-                if rel_key not in t_sched:
-                    t_sched[rel_key] = rel_cover
-                if not t_subj and rel_subj:
-                    t_subj = rel_subj
+                if rel_cover: break
+            if rel_cover and rel_key not in t_sched:
+                t_sched[rel_key] = rel_cover
+            if not t_subj and rel_subj:
+                t_subj = rel_subj
 
         if not t_sched:
-            continue  # teacher has no slots in this grade
+            continue
 
-        sn   = f"Grade {gnum}"
-        ws_t = wb_out.create_sheet(sn)
-        write_teacher_sheet(
-            ws_t, "", teacher_name, t_subj or "—",
-            "NAT", "Lower Secondary",
-            t_sched, {}, now_str, hc
-        )
-        any_written = True
+        grade_data.append((gnum, hc, t_sched, t_subj))
+        if t_subj and t_subj not in all_subj:
+            all_subj.append(t_subj)
 
-    if any_written:
-        wb_out.save(out_path)
-    return any_written
+    if not grade_data:
+        return False
+
+    # Fill subject cell
+    subj_cell.value = " / ".join(all_subj) or "—"
+
+    # ════════════════════════════════════════════════════════
+    # GRADE GRIDS — stacked vertically starting at row 9
+    # Each grade: 1 label row + 1 header row + 11 slot rows = 13 rows
+    # ════════════════════════════════════════════════════════
+    current_row = 9  # start after header block
+
+    for gi, (gnum, hc, t_sched, t_subj) in enumerate(grade_data):
+
+        # ── Grade label row ──────────────────────────────────
+        ws.row_dimensions[current_row].height = 24.0
+        ws.merge_cells(start_row=current_row, start_column=1,
+                       end_row=current_row, end_column=7)
+        ce = ws.cell(row=current_row, column=1,
+                     value=f"  GRADE {gnum}  TIMETABLE")
+        ce.font      = _f(bold=True, sz=13, color=WHITE)
+        ce.fill      = _fill(hc)
+        ce.alignment = _aln("left", "center")
+        current_row += 1
+
+        # ── Column headers row ───────────────────────────────
+        ws.row_dimensions[current_row].height = 19.95
+        for c, txt in enumerate(["TIME","MONDAY","TUESDAY","WEDNESDAY","THURSDAY","FRIDAY"], 2):
+            put(current_row, c, txt,
+                font=_f(bold=True, sz=12, color=WHITE),
+                fill=_fill(hc),
+                aln=_aln("center","center"), border=ALL)
+        current_row += 1
+
+        # ── Slot rows ────────────────────────────────────────
+        for sn, time_str, lbl, is_break, height in SLOT_DATA:
+            ws.row_dimensions[current_row].height = height
+
+            put(current_row, 2, time_str,
+                font=_f(sz=11, color=BLACK),
+                aln=Alignment(horizontal="justify" if is_break else None,
+                              vertical="top", wrap_text=True),
+                border=ALL)
+
+            if is_break:
+                ws.merge_cells(start_row=current_row, start_column=3,
+                               end_row=current_row, end_column=7)
+                ce = ws.cell(row=current_row, column=3, value=lbl)
+                ce.font      = _f(bold=True, sz=11, color=BLACK)
+                ce.fill      = _fill(BREAK_BG)
+                ce.alignment = _aln("center","center")
+                ce.border    = ALL
+                for c in range(4, 7):
+                    ws.cell(row=current_row, column=c).border = TB
+                ws.cell(row=current_row, column=7).border = RTB
+            else:
+                pidx = PERIOD_SNS.index(sn)
+                for ci, d in enumerate(range(5), 3):
+                    cls_name = t_sched.get((d, pidx), "")
+                    put(current_row, ci, cls_name,
+                        font=_f(bold=bool(cls_name), sz=11, color=BLACK),
+                        aln=_aln("center","center",wrap=True), border=ALL)
+
+            current_row += 1
+
+        # ── Gap between grades ───────────────────────────────
+        if gi < len(grade_data) - 1:
+            ws.row_dimensions[current_row].height = 8.0
+            current_row += 1
+
+    # ════════════════════════════════════════════════════════
+    # NOTES block at the bottom
+    # ════════════════════════════════════════════════════════
+    current_row += 1
+    ws.row_dimensions[current_row].height = 106.95
+    notes = (
+        "IMPORTANT POINTS TO BE NOTED:\n"
+        "1. This format should be used by all the schools WITHOUT FAIL. "
+        "No any formats can be used to prepare Subject Timetables.\n"
+        "2. The subject teacher will be officially assigned to the section in which "
+        "she conducts the highest number of periods, based on her personal timetable.\n"
+        "3. Each new subject teacher should be assigned a senior teacher preferably "
+        "from the same subject area for guidance and observation for one term."
+    )
+    ws.merge_cells(start_row=current_row, start_column=2,
+                   end_row=current_row, end_column=7)
+    ce = ws.cell(row=current_row, column=2, value=notes)
+    ce.font      = Font(name="Arial Bold", bold=True, size=11, color=BLACK)
+    ce.fill      = _fill(NOTES_BG)
+    ce.alignment = _aln("justify","center",wrap=True)
+    ce.border    = ALL
+    for c in range(3, 7):
+        ws.cell(row=current_row, column=c).border = TB
+    ws.cell(row=current_row, column=7).border = RTB
+
+    wb.save(out_path)
+    return True
